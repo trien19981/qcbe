@@ -1,0 +1,58 @@
+# API + Redis trong Docker. Postgres dùng remote — bắt buộc có DATABASE_URL trong `.env` (cùng thư mục).
+#   cp .env.example .env   # rồi chỉnh DATABASE_URL trỏ remote
+#   docker compose up --build -d
+# API: http://127.0.0.1:8002/docs
+#
+# Schema bảng users: chạy document/sql/001_users.sql trên DB remote (psql / GUI).
+# Seed: docker compose exec api python scripts/seed_dev_user.py
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - qcmaster_redis:/data
+
+  api:
+    build: .
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env to your remote postgresql+asyncpg URL}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-docker-secret-change-me-min-32-chars}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      COOKIE_SECURE: "false"
+      COOKIE_SAMESITE: lax
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-}
+      EMBEDDING_SERVICE_INTERNAL_KEY: ${EMBEDDING_SERVICE_INTERNAL_KEY:-}
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    command: rq worker --url redis://redis:6379/0 document_processing
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env to your remote postgresql+asyncpg URL}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-docker-secret-change-me-min-32-chars}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-}
+      EMBEDDING_SERVICE_INTERNAL_KEY: ${EMBEDDING_SERVICE_INTERNAL_KEY:-}
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_REGION: ${R2_REGION:-auto}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
+    depends_on:
+      - redis
+
+volumes:
+  qcmaster_redis:
