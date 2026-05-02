@@ -39,6 +39,7 @@ from app.routers import (
     project_documents_upload,
     project_members,
     projects,
+    testcases,
 )
 
 
@@ -105,6 +106,7 @@ app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
 app.include_router(chunks.router, prefix="/api/v1", tags=["chunks"])
 app.include_router(embeddings.router, prefix="/api/v1", tags=["embeddings"])
 app.include_router(invitations.router, prefix="/api/v1", tags=["invitations"])
+app.include_router(testcases.router, prefix="/api/v1", tags=["testcases"])
 
 
 @app.get("/")

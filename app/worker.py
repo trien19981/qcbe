@@ -139,3 +139,22 @@ def enqueue_version_processing(version_id: str, job_db_id: str) -> str:
         job_timeout=3600,
     )
     return rq_job.id
+
+
+def run_tc_generate_job_worker(job_id: str) -> None:
+    """RQ entrypoint for S12 testcase generation."""
+    from app.services.tc_generate_run import run_tc_generate_job_sync
+
+    run_tc_generate_job_sync(job_id)
+
+
+def enqueue_tc_generate(job_db_id: str) -> str:
+    """Enqueue S12 testcase generation job. Returns RQ job id."""
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        run_tc_generate_job_worker,
+        job_db_id,
+        job_timeout=3600,
+    )
+    return rq_job.id
