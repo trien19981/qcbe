@@ -26,7 +26,20 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 from app.exceptions import ApiError, api_error_handler
 from app.models.processing_job import ProcessingJob
 from app.redis_client import close_redis
-from app.routers import auth, chat, chunks, documents, embeddings, health, invitations, project_documents, project_documents_upload, project_members, projects
+from app.routers import (
+    auth,
+    chat,
+    chunks,
+    diff_viewer,
+    documents,
+    embeddings,
+    health,
+    invitations,
+    project_documents,
+    project_documents_upload,
+    project_members,
+    projects,
+)
 
 
 async def _recover_stale_jobs() -> None:
@@ -87,6 +100,7 @@ app.include_router(project_documents.router, prefix="/api/v1/projects", tags=["p
 app.include_router(project_documents_upload.router, prefix="/api/v1", tags=["project-documents-upload"])
 app.include_router(project_members.router, prefix="/api/v1/projects", tags=["project-members"])
 app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
+app.include_router(diff_viewer.router, prefix="/api/v1", tags=["diff-viewer"])
 app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
 app.include_router(chunks.router, prefix="/api/v1", tags=["chunks"])
 app.include_router(embeddings.router, prefix="/api/v1", tags=["embeddings"])
