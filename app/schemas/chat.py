@@ -59,6 +59,8 @@ class CitationOut(BaseModel):
     section: str | None = None
     document_id: UUID | None = None
     version_id: UUID | None = None
+    version_no: int | None = None
+    version_status: str | None = None
     preview: str | None = None
     similarity_score: float | None = None
 

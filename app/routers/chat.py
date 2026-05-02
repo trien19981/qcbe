@@ -418,33 +418,41 @@ async def _claude_answer(
         if isinstance(meta.get("section_path"), list) and meta.get("section_path"):
             section = str(meta["section_path"][-1])
         section = section or str(meta.get("section") or "")
+        ver_no = c.get("version_no")
+        ver_st = c.get("version_status", "")
+        if ver_no is not None:
+            if ver_st == "approved":
+                version_suffix = f" · v{ver_no} approved"
+                version_label = f" [v{ver_no} · approved ✓]"
+            elif ver_st == "ready_for_review":
+                version_suffix = f" · v{ver_no} review"
+                version_label = f" [v{ver_no} · đang review]"
+            else:
+                version_suffix = f" · v{ver_no}"
+                version_label = f" [v{ver_no}]"
+        else:
+            version_suffix = ""
+            version_label = ""
+
         badge = _make_badge(doc_type or None, screen or None, section or None)
+        badge_with_version = badge.rstrip("]") + version_suffix + "]" if version_suffix else badge
         preview = " ".join(str(c.get("content_text") or "").replace("\n", " ").split())[:80]
         citations.append(
             CitationOut(
                 index=i,
                 chunk_id=c.get("chunk_id"),
-                badge_text=badge,
+                badge_text=badge_with_version,
                 doc_type=doc_type or None,
                 screen=screen or None,
                 section=section or None,
                 document_id=c.get("document_id"),
                 version_id=c.get("version_id"),
+                version_no=ver_no,
+                version_status=ver_st or None,
                 preview=preview,
                 similarity_score=float(c.get("score") or 0.0),
             )
         )
-        ver_no = c.get("version_no")
-        ver_st = c.get("version_status", "")
-        if ver_no is not None:
-            if ver_st == "approved":
-                version_label = f" [v{ver_no} · approved ✓]"
-            elif ver_st == "ready_for_review":
-                version_label = f" [v{ver_no} · đang review]"
-            else:
-                version_label = f" [v{ver_no}]"
-        else:
-            version_label = ""
         ctx_lines.append(f"[CITATION_{i}] {badge}{version_label}\n{c.get('content_text')}\n")
 
     system = (
