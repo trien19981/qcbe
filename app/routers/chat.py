@@ -3,12 +3,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, AsyncGenerator
 
 logger = logging.getLogger(__name__)
+
+# Matches *term* or **term** — user-marked emphasis for weighted retrieval
+_EMPHASIS_RE = re.compile(r'\*{1,2}(.+?)\*{1,2}')
+
+
+def _parse_emphasized(query: str) -> tuple[str, list[str]]:
+    """Extract emphasized terms from *term* or **term** syntax.
+
+    Returns (clean_query, emphasized_terms) where clean_query has the
+    asterisks stripped and emphasized_terms is a list of the marked phrases.
+
+    Example:
+      "*Card trắng* có *kích thước* là bao nhiêu?"
+      → ("Card trắng có kích thước là bao nhiêu?", ["Card trắng", "kích thước"])
+    """
+    emphasized = [m.group(1).strip() for m in _EMPHASIS_RE.finditer(query)]
+    clean = _EMPHASIS_RE.sub(lambda m: m.group(1), query).strip()
+    return clean, emphasized
 
 import httpx
 from fastapi import APIRouter, Depends, Path, Query, status
@@ -187,6 +206,7 @@ async def _retrieve_chunks(
     scope_config: dict,
     query_vec: list[float],
     query_text: str = "",
+    fts_text: str = "",
     top_k: int = 8,
     dist_threshold: float = _DIST_THRESHOLD,
     min_fts_rank_score: float = _MIN_FTS_RANK_SCORE,
@@ -198,6 +218,9 @@ async def _retrieve_chunks(
       1. Vector arm: dist_threshold (L2 < 0.85 → cosine > 0.64)
       2. FTS arm: min_fts_rank_score (ts_rank_cd floor to filter keyword noise)
       3. Python post-filter: min_rrf_score drops low-relevance chunks after fusion
+
+    fts_text: when provided (e.g. user-emphasized terms), the FTS arm uses it
+    instead of query_text so keyword matching focuses on the important terms.
     """
     allowed_version_status = ("approved", "ready_for_review")
     doc_types = scope_config.get("doc_types") if isinstance(scope_config.get("doc_types"), list) else None
@@ -241,10 +264,12 @@ async def _retrieve_chunks(
     ])
 
     clean_query = (query_text or "").strip()
-    use_fts = bool(clean_query)
+    # Use explicit fts_text (emphasized terms) when provided, else fall back to full query.
+    clean_fts = (fts_text or "").strip() or clean_query
+    use_fts = bool(clean_fts)
 
     if use_fts:
-        params["query_text"] = clean_query
+        params["query_text"] = clean_fts
         sql = f"""
           WITH
           vr AS (
@@ -393,28 +418,52 @@ async def _claude_answer(
         if isinstance(meta.get("section_path"), list) and meta.get("section_path"):
             section = str(meta["section_path"][-1])
         section = section or str(meta.get("section") or "")
+        ver_no = c.get("version_no")
+        ver_st = c.get("version_status", "")
+        if ver_no is not None:
+            if ver_st == "approved":
+                version_suffix = f" · v{ver_no} approved"
+                version_label = f" [v{ver_no} · approved ✓]"
+            elif ver_st == "ready_for_review":
+                version_suffix = f" · v{ver_no} review"
+                version_label = f" [v{ver_no} · đang review]"
+            else:
+                version_suffix = f" · v{ver_no}"
+                version_label = f" [v{ver_no}]"
+        else:
+            version_suffix = ""
+            version_label = ""
+
         badge = _make_badge(doc_type or None, screen or None, section or None)
+        badge_with_version = badge.rstrip("]") + version_suffix + "]" if version_suffix else badge
         preview = " ".join(str(c.get("content_text") or "").replace("\n", " ").split())[:80]
         citations.append(
             CitationOut(
                 index=i,
                 chunk_id=c.get("chunk_id"),
-                badge_text=badge,
+                badge_text=badge_with_version,
                 doc_type=doc_type or None,
                 screen=screen or None,
                 section=section or None,
                 document_id=c.get("document_id"),
                 version_id=c.get("version_id"),
+                version_no=ver_no,
+                version_status=ver_st or None,
                 preview=preview,
                 similarity_score=float(c.get("score") or 0.0),
             )
         )
-        ctx_lines.append(f"[CITATION_{i}] {badge}\n{c.get('content_text')}\n")
+        ctx_lines.append(f"[CITATION_{i}] {badge}{version_label}\n{c.get('content_text')}\n")
 
     system = (
         "Bạn là trợ lý Q&A cho tài liệu dự án.\n"
         "Chỉ trả lời dựa trên CONTEXT. Nếu không đủ thông tin, nói rõ không tìm thấy.\n"
         "Khi sử dụng 1 đoạn trong CONTEXT, chèn token CITATION_i đúng index, ví dụ: ... CITATION_0\n"
+        "\n"
+        "Khi CONTEXT chứa thông tin từ NHIỀU VERSION của cùng tài liệu, hãy trả lời theo cấu trúc:\n"
+        "1. Dẫn chứng từng phiên bản: 'Theo tài liệu đã approved (vX): ...' và 'Tuy nhiên, phiên bản đang review (vY) mô tả lại: ...'\n"
+        "2. Kết luận: version đã approved là tài liệu chính thức hiện tại.\n"
+        "3. Đánh dấu điểm khác biệt bằng 🔴 **Thay đổi:** <nội dung> để người đọc chú ý.\n"
     )
 
     # Current turn: CONTEXT + câu hỏi mới.
@@ -984,12 +1033,28 @@ async def send_message(
     )
     await session.commit()
 
+    # Parse emphasis markers (*term* / **term**) from the user's message.
+    # clean_content has asterisks stripped; emphasized contains the marked phrases.
+    clean_content, emphasized = _parse_emphasized(body.content)
+
     # Build contextual retrieval query: current question + last 2 user turns for
     # follow-up awareness (e.g. "cái đó là gì?" → "cái đó" refers to prior context).
     prior_user_ctx = " ".join(
         m["content"] for m in recent_history[-4:] if m["role"] == "user"
     )
-    retrieval_query = (body.content + " " + prior_user_ctx).strip()[:600]
+
+    # Vector embedding: use clean content as-is — bge-m3 is a contextual model,
+    # repetition distorts rather than boosts the embedding vector.
+    retrieval_query = (clean_content + " " + prior_user_ctx).strip()[:600]
+
+    # FTS query: emphasized terms joined with OR so the FTS arm boosts chunks that
+    # contain ANY emphasized term (not ALL — AND would exclude chunks that use
+    # English notation like "440px" instead of Vietnamese "kích thước").
+    # No prior_user_ctx here — keeping FTS focused prevents false AND matches.
+    if emphasized:
+        fts_text = " OR ".join(f'"{t}"' if " " in t else t for t in emphasized)
+    else:
+        fts_text = ""
 
     # Retrieval: hybrid vector + FTS with RRF fusion.
     qvec = await _embed_query(retrieval_query)
@@ -1000,8 +1065,27 @@ async def send_message(
         scope_config=scope_config,
         query_vec=qvec,
         query_text=retrieval_query,
+        fts_text=fts_text,
         top_k=8,
     )
+
+    # Enrich each chunk with version_no and version_status so Claude can distinguish
+    # approved vs. pending-review sources when formatting multi-version answers.
+    if chunks:
+        _ver_ids = list({str(c["version_id"]) for c in chunks if c.get("version_id")})
+        if _ver_ids:
+            _placeholders = ", ".join(f":_vid_{i}" for i in range(len(_ver_ids)))
+            _ver_rows = (
+                await session.execute(
+                    text(f"SELECT id, version_no, status FROM doc_versions WHERE id::text IN ({_placeholders})"),
+                    {f"_vid_{i}": v for i, v in enumerate(_ver_ids)},
+                )
+            ).all()
+            _ver_map = {str(r.id): (int(r.version_no), str(r.status)) for r in _ver_rows}
+            for c in chunks:
+                _vid = str(c["version_id"]) if c.get("version_id") else None
+                if _vid and _vid in _ver_map:
+                    c["version_no"], c["version_status"] = _ver_map[_vid]
 
     async def _save_assistant(full_text: str, citations: list[CitationOut]) -> MessageOut:
         assistant_id = uuid.uuid4()
@@ -1059,7 +1143,7 @@ async def send_message(
 
     if not body.stream:
         answer, citations = await _claude_answer(
-            question=body.content, context_chunks=chunks, history=recent_history
+            question=clean_content, context_chunks=chunks, history=recent_history
         )
         assistant = await _save_assistant(answer, citations)
         user_out = MessageOut(id=user_msg_id, role="user", content=body.content, citations=[], created_at=datetime.now(UTC))
@@ -1073,7 +1157,7 @@ async def send_message(
         citations: list[CitationOut] = []
         try:
             answer, citations = await _claude_answer(
-                question=body.content, context_chunks=chunks, history=recent_history
+                question=clean_content, context_chunks=chunks, history=recent_history
             )
             # naive delta streaming: split by words (since we used create, not stream API)
             for w in answer.split(" "):

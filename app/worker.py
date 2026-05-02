@@ -11,6 +11,40 @@ from app.config import settings
 
 
 # ---------------------------------------------------------------------------
+# RQ task — semantic diff analysis
+# ---------------------------------------------------------------------------
+
+def analyze_diff_semantic(diff_review_id: str) -> None:
+    """Compute semantic diff for a diff_review using chunk embeddings.
+
+    Called by the RQ worker. Failures are swallowed so the router's basic-diff
+    fallback can take over after the 5-minute grace window.
+    """
+    async def _run() -> None:
+        from app.database import engine
+        from app.diff_analysis import analyze_diff_semantic_async
+
+        try:
+            await analyze_diff_semantic_async(diff_review_id)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def enqueue_diff_analysis(diff_review_id: str) -> str:
+    """Enqueue a semantic diff analysis job. Returns the RQ job ID."""
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        analyze_diff_semantic,
+        diff_review_id,
+        job_timeout=300,
+    )
+    return rq_job.id
+
+
+# ---------------------------------------------------------------------------
 # RQ task — must be a top-level sync function so RQ can import it by path.
 # ---------------------------------------------------------------------------
 
