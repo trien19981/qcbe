@@ -27,6 +27,7 @@ from app.exceptions import ApiError, api_error_handler
 from app.models.processing_job import ProcessingJob
 from app.redis_client import close_redis
 from app.routers import (
+    ai_prompts,
     auth,
     chat,
     chunks,
@@ -107,6 +108,7 @@ app.include_router(chunks.router, prefix="/api/v1", tags=["chunks"])
 app.include_router(embeddings.router, prefix="/api/v1", tags=["embeddings"])
 app.include_router(invitations.router, prefix="/api/v1", tags=["invitations"])
 app.include_router(testcases.router, prefix="/api/v1", tags=["testcases"])
+app.include_router(ai_prompts.router, prefix="/api/v1", tags=["ai-prompts"])
 
 
 @app.get("/")

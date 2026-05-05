@@ -13,27 +13,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services import ai_prompts as ai_prompt_svc
 
 logger = logging.getLogger(__name__)
-
-GENERATE_SYSTEM_PROMPT = """\
-Bạn là chuyên gia QA. Dựa trên tài liệu dưới đây, hãy tạo danh sách testcase đầy đủ theo format JSON.
-Toàn bộ nội dung (title, steps, expected_result) phải viết bằng tiếng Việt.
-
-Mỗi testcase gồm:
-- title: tiêu đề ngắn gọn bằng tiếng Việt (tối đa 80 ký tự)
-- steps: danh sách bước thực hiện bằng tiếng Việt (array of string)
-- expected_result: kết quả mong đợi bằng tiếng Việt
-- priority: "critical" | "high" | "medium" | "low"
-- tc_type: "manual" | "api" | "e2e"
-- source_chunk_index: số nguyên index (0-based) của đoạn tài liệu liên quan nhất trong danh sách [TÀI LIỆU] (mỗi đoạn bắt đầu bằng dòng "--- Chunk N ---")
-
-Chỉ trả về JSON array, không có text nào khác.
-Tạo đủ testcase để cover: happy path, error path, edge case, boundary value.
-
-[TÀI LIỆU]
-{context}
-"""
 
 
 def _slug_prefix(slug: str) -> str:
@@ -225,7 +207,16 @@ async def run_tc_generate_job(job_id: str) -> None:
                 client = AsyncAnthropic(**client_kw)
 
                 context = _build_context(chunks)
-                prompt = GENERATE_SYSTEM_PROMPT.format(context=context)
+                tmpl = await ai_prompt_svc.get_ai_prompt(
+                    session,
+                    project_id,
+                    ai_prompt_svc.TC_GENERATE_PROMPT,
+                    ai_prompt_svc.DEFAULT_TC_GENERATE_PROMPT,
+                )
+                if "{context}" in tmpl:
+                    prompt = ai_prompt_svc.inject_context(tmpl, context)
+                else:
+                    prompt = tmpl.rstrip() + "\n\n[TÀI LIỆU]\n" + context
 
                 msg = await client.messages.create(
                     model="claude-sonnet-4-20250514",

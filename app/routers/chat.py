@@ -44,6 +44,7 @@ from app.exceptions import ApiError
 from app.models.user import User
 from app.project_access import is_system_admin, project_member_role, require_project_access
 from app.redis_client import get_redis
+from app.services import ai_prompts as ai_prompt_svc
 from app.schemas.chat import (
     ChatUserBrief,
     ConversationMessagesResponse,
@@ -395,6 +396,8 @@ def _make_badge(doc_type: str | None, screen: str | None, section: str | None) -
 
 
 async def _claude_answer(
+    session: AsyncSession,
+    project_id: uuid.UUID,
     *,
     question: str,
     context_chunks: list[dict],
@@ -455,15 +458,11 @@ async def _claude_answer(
         )
         ctx_lines.append(f"[CITATION_{i}] {badge}{version_label}\n{c.get('content_text')}\n")
 
-    system = (
-        "Bạn là trợ lý Q&A cho tài liệu dự án.\n"
-        "Chỉ trả lời dựa trên CONTEXT. Nếu không đủ thông tin, nói rõ không tìm thấy.\n"
-        "Khi sử dụng 1 đoạn trong CONTEXT, chèn token CITATION_i đúng index, ví dụ: ... CITATION_0\n"
-        "\n"
-        "Khi CONTEXT chứa thông tin từ NHIỀU VERSION của cùng tài liệu, hãy trả lời theo cấu trúc:\n"
-        "1. Dẫn chứng từng phiên bản: 'Theo tài liệu đã approved (vX): ...' và 'Tuy nhiên, phiên bản đang review (vY) mô tả lại: ...'\n"
-        "2. Kết luận: version đã approved là tài liệu chính thức hiện tại.\n"
-        "3. Đánh dấu điểm khác biệt bằng 🔴 **Thay đổi:** <nội dung> để người đọc chú ý.\n"
+    system = await ai_prompt_svc.get_ai_prompt(
+        session,
+        project_id,
+        ai_prompt_svc.QA_ANSWER_SYSTEM,
+        ai_prompt_svc.DEFAULT_QA_ANSWER_SYSTEM,
     )
 
     # Current turn: CONTEXT + câu hỏi mới.
@@ -747,11 +746,16 @@ async def create_conversation(
                     client_kwargs: dict = {"api_key": settings.anthropic_api_key}
                     if settings.anthropic_base_url:
                         client_kwargs["base_url"] = settings.anthropic_base_url
-                    gen_user_content = (
-                        "Dựa trên tài liệu sau, tạo 3 câu hỏi ngắn để người dùng hỏi AI. "
-                        "Mỗi câu hỏi 1 dòng.\n\n---\n"
-                        f"{ctx}\n---"
+                    tmpl = await ai_prompt_svc.get_ai_prompt(
+                        bg_session,
+                        uuid.UUID(str(_snap_project_id)),
+                        ai_prompt_svc.QA_SUGGESTED_QUESTIONS_USER,
+                        ai_prompt_svc.DEFAULT_QA_SUGGESTED_QUESTIONS_USER,
                     )
+                    if "{context}" in tmpl:
+                        gen_user_content = ai_prompt_svc.inject_context(tmpl, ctx)
+                    else:
+                        gen_user_content = tmpl.rstrip() + "\n\n---\n" + ctx + "\n---"
                     logger.debug(
                         "\n"
                         "╔══════════════════════════════════════════════════════╗\n"
@@ -1143,7 +1147,11 @@ async def send_message(
 
     if not body.stream:
         answer, citations = await _claude_answer(
-            question=clean_content, context_chunks=chunks, history=recent_history
+            session,
+            project_id,
+            question=clean_content,
+            context_chunks=chunks,
+            history=recent_history,
         )
         assistant = await _save_assistant(answer, citations)
         user_out = MessageOut(id=user_msg_id, role="user", content=body.content, citations=[], created_at=datetime.now(UTC))
@@ -1157,7 +1165,11 @@ async def send_message(
         citations: list[CitationOut] = []
         try:
             answer, citations = await _claude_answer(
-                question=clean_content, context_chunks=chunks, history=recent_history
+                session,
+                project_id,
+                question=clean_content,
+                context_chunks=chunks,
+                history=recent_history,
             )
             # naive delta streaming: split by words (since we used create, not stream API)
             for w in answer.split(" "):
