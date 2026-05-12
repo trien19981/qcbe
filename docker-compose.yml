@@ -42,7 +42,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-dev-docker-secret-change-me-min-32-chars}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      # KHÔNG inject ANTHROPIC_BASE_URL ở đây — để env_file kiểm soát.
+      # Lý do: `${ANTHROPIC_BASE_URL:-}` set var = "" khi host shell không export →
+      # Anthropic SDK pick up "" làm base URL → request URL thiếu scheme.
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
       EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-}
       EMBEDDING_SERVICE_INTERNAL_KEY: ${EMBEDDING_SERVICE_INTERNAL_KEY:-}
       R2_ENDPOINT: ${R2_ENDPOINT:-}

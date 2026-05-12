@@ -55,8 +55,9 @@ class DocVersion(Base):
         nullable=False,
     )
     version_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    r2_key: Mapped[str] = mapped_column(Text, nullable=False)
-    r2_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False, default="upload")  # upload | figma | backlog
+    r2_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    r2_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(_version_status_enum, nullable=False)
     changelog_md: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -70,10 +71,15 @@ class Chunk(Base):
     __tablename__ = "chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    doc_version_id: Mapped[uuid.UUID] = mapped_column(
+    doc_version_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("doc_versions.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+    )
+    figma_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("figma_artifacts.id", ondelete="CASCADE"),
+        nullable=True,
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content_text: Mapped[str] = mapped_column(Text, nullable=False)

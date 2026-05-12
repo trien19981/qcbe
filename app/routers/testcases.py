@@ -56,6 +56,9 @@ _tc = table(
     column("needs_review"),
     column("tc_sequential"),
     column("tc_id"),
+    column("technique"),
+    column("source_tvp_id"),
+    column("source_tvp_section"),
     column("created_at"),
     column("updated_at"),
     column("created_by"),
@@ -262,6 +265,9 @@ async def list_project_testcases(
         _tc.c.expected_result,
         _tc.c.tc_id,
         _tc.c.tc_sequential,
+        _tc.c.technique,
+        _tc.c.source_tvp_id,
+        _tc.c.source_tvp_section,
         _tc.c.created_at,
         _tc.c.updated_at,
         _tc.c.created_by,
@@ -340,6 +346,9 @@ async def list_project_testcases(
                 steps_count=steps_count or int(r.steps_len or 0),
                 steps_preview=preview,
                 expected_result=str(r.expected_result) if r.expected_result else None,
+                technique=str(r.technique) if r.technique else None,
+                source_tvp_id=uuid.UUID(str(r.source_tvp_id)) if r.source_tvp_id else None,
+                source_tvp_section=str(r.source_tvp_section) if r.source_tvp_section else None,
                 linked_chunks=links,
                 linked_chunks_count=len(links),
                 created_at=r.created_at,
@@ -484,24 +493,54 @@ async def enqueue_generate_testcases(
     if chk.scalar_one_or_none():
         raise ApiError(409, "CONFLICT", "Đang có job generate đang chạy")
 
-    # Ensure at least one approved chunk exists for selection
     doc_types = body.doc_types
-    rchunks = await session.execute(
-        text(
-            """
-            SELECT COUNT(*) FROM chunks c
-            INNER JOIN doc_versions dv ON dv.id = c.doc_version_id AND dv.status = 'approved'
-            INNER JOIN documents d ON d.id = dv.document_id
-            WHERE d.project_id = CAST(:pid AS uuid)
-              AND d.screen_name = :sn
-              AND d.doc_type::text = ANY(:dts)
-            """
-        ),
-        {"pid": str(project_id), "sn": body.screen_name, "dts": doc_types},
-    )
-    nchunks = int(rchunks.scalar_one() or 0)
-    if nchunks == 0:
-        raise ApiError(404, "NOT_FOUND", "Màn hình không có tài liệu approved cho doc_types đã chọn")
+
+    # Validate TVP nếu có
+    if body.tvp_id is not None:
+        tr = await session.execute(
+            text(
+                """
+                SELECT id, project_id, screen_name, status
+                FROM test_viewpoints WHERE id = CAST(:tid AS uuid)
+                """
+            ),
+            {"tid": str(body.tvp_id)},
+        )
+        trow = tr.mappings().first()
+        if trow is None:
+            raise ApiError(404, "NOT_FOUND", "TVP không tồn tại")
+        if str(trow["project_id"]) != str(project_id):
+            raise ApiError(400, "BAD_REQUEST", "TVP không thuộc project này")
+        if str(trow.get("screen_name")) != body.screen_name:
+            raise ApiError(
+                400,
+                "BAD_REQUEST",
+                f"TVP thuộc màn hình '{trow.get('screen_name')}' khác với '{body.screen_name}'",
+            )
+        if str(trow.get("status") or "") != "approved":
+            raise ApiError(409, "CONFLICT", "TVP chưa được approve — không thể generate TC từ TVP")
+
+    nchunks = 0
+    if doc_types:
+        rchunks = await session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM chunks c
+                INNER JOIN doc_versions dv ON dv.id = c.doc_version_id AND dv.status = 'approved'
+                INNER JOIN documents d ON d.id = dv.document_id
+                WHERE d.project_id = CAST(:pid AS uuid)
+                  AND d.screen_name = :sn
+                  AND d.doc_type::text = ANY(:dts)
+                """
+            ),
+            {"pid": str(project_id), "sn": body.screen_name, "dts": doc_types},
+        )
+        nchunks = int(rchunks.scalar_one() or 0)
+
+    if body.tvp_id is None and nchunks == 0:
+        raise ApiError(
+            404, "NOT_FOUND", "Màn hình không có tài liệu approved cho doc_types đã chọn"
+        )
 
     job_id = uuid.uuid4()
     await session.execute(
@@ -509,9 +548,10 @@ async def enqueue_generate_testcases(
             """
             INSERT INTO tc_generate_jobs (
               id, project_id, screen_name, doc_types, tc_type, overwrite_existing,
-              status, progress, result, created_by, created_at, updated_at
+              tvp_id, status, progress, result, created_by, created_at, updated_at
             ) VALUES (
               CAST(:id AS uuid), CAST(:pid AS uuid), :sn, CAST(:dts AS text[]), :tct, :ov,
+              CAST(:tvpid AS uuid),
               'queued', '{}'::jsonb, '{}'::jsonb, CAST(:uid AS uuid), NOW(), NOW()
             )
             """
@@ -523,6 +563,7 @@ async def enqueue_generate_testcases(
             "dts": doc_types,
             "tct": body.tc_type,
             "ov": body.overwrite_existing,
+            "tvpid": str(body.tvp_id) if body.tvp_id else None,
             "uid": str(user.id),
         },
     )
@@ -530,12 +571,13 @@ async def enqueue_generate_testcases(
 
     enqueue_tc_generate(str(job_id))
 
-    est = min(60, 10 + nchunks * 2)
+    est = min(120, 15 + nchunks * 3)
     return TestcaseGenerateAccepted(
         job_id=job_id,
         screen_name=body.screen_name,
         doc_types=doc_types,
-        estimated_tc_count=min(32, max(4, nchunks * 2)),
+        tvp_id=body.tvp_id,
+        estimated_tc_count=min(40, max(6, nchunks * 2 if nchunks else 16)),
         estimated_seconds=est,
         message="Đang generate testcase. Vui lòng chờ...",
     )

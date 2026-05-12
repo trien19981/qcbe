@@ -8,12 +8,16 @@ import re
 import uuid
 from typing import Any
 
-from anthropic import AsyncAnthropic
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services import ai_prompts as ai_prompt_svc
+from app.services.anthropic_stream_final import (
+    build_anthropic_client,
+    loads_llm_json_array,
+    stream_user_message_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +91,50 @@ def _build_context(chunks: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+async def _fetch_tvp_for_tc(
+    session: AsyncSession, tvp_id: uuid.UUID
+) -> dict[str, Any] | None:
+    r = await session.execute(
+        text(
+            """
+            SELECT id, project_id, screen_name, status, content_md
+            FROM test_viewpoints WHERE id = CAST(:tid AS uuid)
+            """
+        ),
+        {"tid": str(tvp_id)},
+    )
+    row = r.mappings().first()
+    return dict(row) if row else None
+
+
+_ALLOWED_TECHNIQUES = {"BVA", "EP", "DT", "ST", "Negative", "UC", "EG"}
+
+
+def _normalize_technique(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s in _ALLOWED_TECHNIQUES:
+        return s
+    upper = s.upper()
+    aliases = {
+        "BOUNDARY": "BVA",
+        "BOUNDARY VALUE": "BVA",
+        "EQUIVALENCE": "EP",
+        "EQUIVALENCE PARTITIONING": "EP",
+        "DECISION": "DT",
+        "DECISION TABLE": "DT",
+        "STATE": "ST",
+        "STATE TRANSITION": "ST",
+        "USE CASE": "UC",
+        "USECASE": "UC",
+        "ERROR GUESSING": "EG",
+        "ERROR-GUESSING": "EG",
+        "NEGATIVE": "Negative",
+    }
+    return aliases.get(upper)
+
+
 async def _next_tc_sequential(session: AsyncSession, project_id: uuid.UUID) -> int:
     r = await session.execute(
         text(
@@ -137,7 +185,7 @@ async def run_tc_generate_job(job_id: str) -> None:
                 text(
                     """
                     SELECT id, project_id, screen_name, doc_types, tc_type, status, created_by,
-                           overwrite_existing
+                           overwrite_existing, tvp_id
                     FROM tc_generate_jobs WHERE id = :jid
                     """
                 ),
@@ -164,20 +212,57 @@ async def run_tc_generate_job(job_id: str) -> None:
             tc_type_default = str(job["tc_type"])
             created_by = job.get("created_by")
             overwrite = bool(job.get("overwrite_existing"))
+            tvp_id_raw = job.get("tvp_id")
+            tvp_uuid: uuid.UUID | None = (
+                uuid.UUID(str(tvp_id_raw)) if tvp_id_raw else None
+            )
 
             try:
                 if overwrite:
                     await _delete_draft_for_screen(session, project_id, screen_name)
                     await session.commit()
 
+                tvp_row: dict[str, Any] | None = None
+                tvp_md = ""
+                if tvp_uuid is not None:
+                    tvp_row = await _fetch_tvp_for_tc(session, tvp_uuid)
+                    if tvp_row is None:
+                        await _exec_job_update(
+                            session,
+                            jid,
+                            status="failed",
+                            error_message="TVP không tồn tại",
+                        )
+                        await session.commit()
+                        return
+                    if str(tvp_row.get("project_id")) != str(project_id):
+                        await _exec_job_update(
+                            session,
+                            jid,
+                            status="failed",
+                            error_message="TVP không thuộc project này",
+                        )
+                        await session.commit()
+                        return
+                    if str(tvp_row.get("status") or "") != "approved":
+                        await _exec_job_update(
+                            session,
+                            jid,
+                            status="failed",
+                            error_message="TVP chưa được approve — không thể generate TC",
+                        )
+                        await session.commit()
+                        return
+                    tvp_md = str(tvp_row.get("content_md") or "")
+
                 chunks = await _fetch_approved_chunks(session, project_id, screen_name, doc_types)
-                if not chunks:
+                if not chunks and not tvp_md:
                     await _exec_job_update(
                         session,
                         jid,
                         status="failed",
                         progress={"total_chunks": 0, "processed_chunks": 0, "percentage": 0},
-                        error_message="Không có chunk tài liệu approved cho lựa chọn này",
+                        error_message="Không có TVP cũng như chunk tài liệu approved để generate TC",
                     )
                     await session.commit()
                     return
@@ -201,37 +286,46 @@ async def run_tc_generate_job(job_id: str) -> None:
                     await session.commit()
                     return
 
-                client_kw: dict[str, Any] = {"api_key": settings.anthropic_api_key}
-                if settings.anthropic_base_url:
-                    client_kw["base_url"] = settings.anthropic_base_url
-                client = AsyncAnthropic(**client_kw)
+                client = build_anthropic_client(
+                    api_key=settings.anthropic_api_key,
+                    base_url=settings.anthropic_base_url,
+                )
 
                 context = _build_context(chunks)
-                tmpl = await ai_prompt_svc.get_ai_prompt(
-                    session,
-                    project_id,
-                    ai_prompt_svc.TC_GENERATE_PROMPT,
-                    ai_prompt_svc.DEFAULT_TC_GENERATE_PROMPT,
-                )
-                if "{context}" in tmpl:
-                    prompt = ai_prompt_svc.inject_context(tmpl, context)
+                if tvp_md:
+                    tmpl = await ai_prompt_svc.get_ai_prompt(
+                        session,
+                        project_id,
+                        ai_prompt_svc.TC_FROM_TVP_PROMPT,
+                        ai_prompt_svc.DEFAULT_TC_FROM_TVP_PROMPT,
+                    )
+                    tmpl = ai_prompt_svc.inject_references(tmpl, ai_prompt_svc.TC_FROM_TVP_PROMPT)
+                    prompt = tmpl.replace("{tvp_md}", tvp_md)
+                    if "{context}" in prompt:
+                        prompt = ai_prompt_svc.inject_context(prompt, context)
+                    else:
+                        prompt = prompt.rstrip() + "\n\n[TÀI LIỆU SPEC]\n" + context
                 else:
-                    prompt = tmpl.rstrip() + "\n\n[TÀI LIỆU]\n" + context
+                    tmpl = await ai_prompt_svc.get_ai_prompt(
+                        session,
+                        project_id,
+                        ai_prompt_svc.TC_GENERATE_PROMPT,
+                        ai_prompt_svc.DEFAULT_TC_GENERATE_PROMPT,
+                    )
+                    if "{context}" in tmpl:
+                        prompt = ai_prompt_svc.inject_context(tmpl, context)
+                    else:
+                        prompt = tmpl.rstrip() + "\n\n[TÀI LIỆU]\n" + context
 
-                msg = await client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=4000,
-                    messages=[{"role": "user", "content": prompt}],
+                raw = await stream_user_message_text(
+                    client,
+                    model=settings.anthropic_model,
+                    max_tokens=16000,
+                    user_text=prompt,
+                    thinking={"type": "disabled"},
                 )
-                raw = ""
-                for block in msg.content:
-                    if hasattr(block, "text"):
-                        raw += block.text
 
-                clean = re.sub(r"```json|```", "", raw).strip()
-                tc_list = json.loads(clean)
-                if not isinstance(tc_list, list):
-                    raise ValueError("LLM output is not a JSON array")
+                tc_list = loads_llm_json_array(raw)
 
                 proj = await session.get(Project, project_id)
                 prefix = _slug_prefix(proj.slug if proj else "prj")
@@ -253,18 +347,24 @@ async def run_tc_generate_job(job_id: str) -> None:
                     if row_tc_type not in ("manual", "api", "e2e"):
                         row_tc_type = tc_type_default
 
+                    technique = _normalize_technique(tc_data.get("technique"))
+                    src_section = str(tc_data.get("source_tvp_section") or "")[:300] or None
+
                     seq = await _next_tc_sequential(session, project_id)
                     tc_uuid = uuid.uuid4()
                     tc_id_str = f"TC-{prefix}-{seq:03d}"
 
-                    ins_sql = """
+                    base_ins = """
                             INSERT INTO testcases (
                               id, project_id, screen_name, title, tc_type, steps, expected_result,
-                              priority, status, needs_review, tc_sequential, tc_id, created_by, created_at, updated_at
+                              priority, status, needs_review, tc_sequential, tc_id,
+                              source_tvp_id, technique, source_tvp_section,
+                              created_by, created_at, updated_at
                             ) VALUES (
                               CAST(:id AS uuid), CAST(:pid AS uuid), :sn, :title, :tct, CAST(:steps AS jsonb), :exp,
                               :pri, 'draft', false, :seq, :tcid,
-                              CAST(:uid AS uuid), NOW(), NOW()
+                              CAST(:tvpid AS uuid), :tech, :tvpsec,
+                              {created_by_value}, NOW(), NOW()
                             )
                             """
                     params_ins: dict[str, Any] = {
@@ -278,25 +378,20 @@ async def run_tc_generate_job(job_id: str) -> None:
                         "pri": priority,
                         "seq": seq,
                         "tcid": tc_id_str,
-                        "uid": str(created_by) if created_by else str(uuid.uuid4()),
+                        "tvpid": str(tvp_uuid) if tvp_uuid else None,
+                        "tech": technique,
+                        "tvpsec": src_section,
                     }
                     if created_by:
-                        await session.execute(text(ins_sql), params_ins)
+                        params_ins["uid"] = str(created_by)
+                        await session.execute(
+                            text(base_ins.format(created_by_value="CAST(:uid AS uuid)")),
+                            params_ins,
+                        )
                     else:
                         await session.execute(
-                            text(
-                                """
-                            INSERT INTO testcases (
-                              id, project_id, screen_name, title, tc_type, steps, expected_result,
-                              priority, status, needs_review, tc_sequential, tc_id, created_by, created_at, updated_at
-                            ) VALUES (
-                              CAST(:id AS uuid), CAST(:pid AS uuid), :sn, :title, :tct, CAST(:steps AS jsonb), :exp,
-                              :pri, 'draft', false, :seq, :tcid,
-                              NULL, NOW(), NOW()
-                            )
-                            """
-                            ),
-                            {k: v for k, v in params_ins.items() if k != "uid"},
+                            text(base_ins.format(created_by_value="NULL")),
+                            params_ins,
                         )
 
                     chunk_idx = int(tc_data.get("source_chunk_index") or 0)

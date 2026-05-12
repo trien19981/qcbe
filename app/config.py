@@ -25,6 +25,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("ANTHROPIC_BASE_URL", "anthropic_base_url"),
     )
+    anthropic_model: str = Field(
+        default="claude-sonnet-4-20250514",
+        validation_alias=AliasChoices("ANTHROPIC_MODEL", "anthropic_model"),
+    )
 
     @field_validator("anthropic_base_url", mode="before")
     @classmethod
@@ -35,6 +39,15 @@ class Settings(BaseSettings):
             return None
         return v
 
+    @field_validator("anthropic_model", mode="before")
+    @classmethod
+    def empty_anthropic_model_to_default(cls, v: object) -> object:
+        if v is None:
+            return "claude-sonnet-4-20250514"
+        if isinstance(v, str) and not v.strip():
+            return "claude-sonnet-4-20250514"
+        return v
+
     # Embedding service (FastAPI độc lập) để BE proxy gọi.
     embedding_service_url: str | None = Field(
         default=None,
@@ -43,6 +56,12 @@ class Settings(BaseSettings):
     embedding_service_internal_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("EMBEDDING_SERVICE_INTERNAL_KEY", "embedding_service_internal_key"),
+    )
+
+    # Figma embedding phase (Phase 2: chunk+embed) — can be disabled temporarily.
+    figma_embedding_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("FIGMA_EMBEDDING_ENABLED", "figma_embedding_enabled"),
     )
 
     @field_validator("embedding_service_url", mode="before")

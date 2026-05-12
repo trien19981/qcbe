@@ -158,3 +158,103 @@ def enqueue_tc_generate(job_db_id: str) -> str:
         job_timeout=3600,
     )
     return rq_job.id
+
+
+def run_qa_generate_job_worker(job_id: str) -> None:
+    """RQ entrypoint for Q&A Gap Analysis generation."""
+    from app.services.qa_generate_run import run_qa_generate_job_sync
+
+    run_qa_generate_job_sync(job_id)
+
+
+def enqueue_qa_generate(job_db_id: str) -> str:
+    """Enqueue Q&A Gap Analysis generation job. Returns RQ job id."""
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        run_qa_generate_job_worker,
+        job_db_id,
+        job_timeout=1800,
+    )
+    return rq_job.id
+
+
+def run_tvp_generate_job_worker(job_id: str) -> None:
+    """RQ entrypoint for TVP generation."""
+    from app.services.tvp_generate_run import run_tvp_generate_job_sync
+
+    run_tvp_generate_job_sync(job_id)
+
+
+def enqueue_tvp_generate(job_db_id: str) -> str:
+    """Enqueue TVP generation job. Returns RQ job id."""
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        run_tvp_generate_job_worker,
+        job_db_id,
+        job_timeout=1800,
+    )
+    return rq_job.id
+
+
+def run_external_sync_job_worker(link_id: str) -> None:
+    """RQ entrypoint for external sync (Figma/Backlog)."""
+
+    async def _run() -> None:
+        from app.database import engine
+        from app.services.external_sync import sync_external_link_async
+
+        try:
+            await sync_external_link_async(link_id)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def enqueue_external_sync(link_id: str) -> str:
+    """Enqueue external sync job. Returns RQ job id."""
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        run_external_sync_job_worker,
+        link_id,
+        retry=Retry(max=3, interval=[30, 120, 600]),
+        job_timeout=1800,
+    )
+    return rq_job.id
+
+
+# ---------------------------------------------------------------------------
+# RQ task — figma artifact embedding (chunk → embed) as a separate phase
+# ---------------------------------------------------------------------------
+
+def run_figma_artifact_embed_job_worker(figma_artifact_id: str) -> None:
+    """RQ entrypoint for FigmaArtifact embed (chunk + embeddings)."""
+
+    async def _run() -> None:
+        from app.database import engine
+        from app.services.external_sync import embed_figma_artifact_async
+
+        try:
+            await embed_figma_artifact_async(figma_artifact_id)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def enqueue_figma_artifact_embedding(figma_artifact_id: str) -> str:
+    """Enqueue FigmaArtifact embedding job. Returns RQ job id."""
+    if not settings.figma_embedding_enabled:
+        return "disabled"
+    conn = Redis.from_url(settings.redis_url)
+    q = Queue("document_processing", connection=conn)
+    rq_job = q.enqueue(
+        run_figma_artifact_embed_job_worker,
+        figma_artifact_id,
+        retry=Retry(max=3, interval=[30, 120, 600]),
+        job_timeout=3600,
+    )
+    return rq_job.id

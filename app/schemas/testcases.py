@@ -42,6 +42,9 @@ class TestcaseListItem(BaseModel):
     steps_count: int
     steps_preview: list[str]
     expected_result: str | None
+    technique: str | None = None
+    source_tvp_id: UUID | None = None
+    source_tvp_section: str | None = None
     linked_chunks: list[LinkedChunkOut]
     linked_chunks_count: int
     created_at: datetime | None
@@ -93,9 +96,10 @@ class TestcaseStatsResponse(BaseModel):
 
 class TestcaseGenerateBody(BaseModel):
     screen_name: str = Field(..., min_length=1, max_length=200)
-    doc_types: list[str] = Field(..., min_length=1)
+    doc_types: list[str] = Field(default_factory=list)
     tc_type: TcType
     overwrite_existing: bool = False
+    tvp_id: UUID | None = None
 
     @field_validator("doc_types")
     @classmethod
@@ -111,6 +115,7 @@ class TestcaseGenerateAccepted(BaseModel):
     job_id: UUID
     screen_name: str
     doc_types: list[str]
+    tvp_id: UUID | None = None
     estimated_tc_count: int
     estimated_seconds: int
     message: str

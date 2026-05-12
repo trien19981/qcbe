@@ -368,6 +368,117 @@ async def _retrieve_chunks(
             "score":       float(row["score"] or 0.0),
         })
 
+    # Figma artifact retrieval — separate path, merged into doc results by score.
+    # Include when: screen scope (always) or project/doc_type scope (design-related).
+    _include_figma = scope_type == "screen" or scope_type not in ("doc_type",) or (
+        isinstance(doc_types, list)
+        and any(dt in doc_types for dt in ("detail_design", "basic_design", "figma"))
+    )
+    if _include_figma:
+        figma_scope: list[str] = ["fa.project_id = :pid", "fa.sync_status = 'synced'"]
+        figma_params: dict = {
+            "pid": str(project_id),
+            "model_name": "BAAI/bge-m3",
+            "qvec": vec_literal,
+            "k": int(top_k),
+            "ck": _CANDIDATE_K,
+            "dist_threshold": float(dist_threshold),
+            "min_fts_rank_score": float(min_fts_rank_score),
+        }
+        if scope_type == "screen" and screen_name:
+            figma_scope.append("fa.screen_name = :screen_name")
+            figma_params["screen_name"] = screen_name
+
+        figma_vec_where = " AND ".join([
+            *figma_scope,
+            "ce.model_name = :model_name",
+            "(ce.embedding <-> CAST(:qvec AS vector)) < :dist_threshold",
+        ])
+        figma_fts_where = " AND ".join(figma_scope)
+
+        if use_fts:
+            figma_params["query_text"] = clean_fts
+            figma_sql = f"""
+              WITH
+              vr AS (
+                SELECT c.id AS chunk_id,
+                       ROW_NUMBER() OVER (ORDER BY ce.embedding <-> CAST(:qvec AS vector)) AS rank_v,
+                       (ce.embedding <-> CAST(:qvec AS vector)) AS distance
+                FROM chunk_embeddings ce
+                JOIN chunks c ON c.id = ce.chunk_id
+                JOIN figma_artifacts fa ON fa.id = c.figma_artifact_id
+                WHERE {figma_vec_where}
+                ORDER BY ce.embedding <-> CAST(:qvec AS vector)
+                LIMIT :ck
+              ),
+              fr AS (
+                SELECT c.id AS chunk_id,
+                       ROW_NUMBER() OVER (
+                         ORDER BY ts_rank_cd(to_tsvector('simple', c.content_text),
+                                             websearch_to_tsquery('simple', :query_text)) DESC
+                       ) AS rank_f
+                FROM chunks c
+                JOIN figma_artifacts fa ON fa.id = c.figma_artifact_id
+                WHERE {figma_fts_where}
+                  AND to_tsvector('simple', c.content_text)
+                      @@ websearch_to_tsquery('simple', :query_text)
+                  AND ts_rank_cd(to_tsvector('simple', c.content_text),
+                                 websearch_to_tsquery('simple', :query_text)) >= :min_fts_rank_score
+                LIMIT :ck
+              ),
+              merged AS (
+                SELECT COALESCE(vr.chunk_id, fr.chunk_id) AS chunk_id,
+                       COALESCE(1.0 / ({_RRF_K}.0 + vr.rank_v::float), 0.0)
+                       + COALESCE(1.0 / ({_RRF_K}.0 + fr.rank_f::float), 0.0) AS rrf_score,
+                       COALESCE(vr.distance, 1.5) AS distance
+                FROM vr FULL OUTER JOIN fr ON vr.chunk_id = fr.chunk_id
+              )
+              SELECT m.chunk_id, m.rrf_score AS score, m.distance,
+                     c.content_text, c.metadata,
+                     fa.id AS document_id, NULL::uuid AS version_id
+              FROM merged m
+              JOIN chunks c ON c.id = m.chunk_id
+              JOIN figma_artifacts fa ON fa.id = c.figma_artifact_id
+              ORDER BY m.rrf_score DESC
+              LIMIT :k
+            """
+        else:
+            figma_sql = f"""
+              SELECT c.id AS chunk_id,
+                     1.0 / ({_RRF_K}.0 + ROW_NUMBER() OVER (
+                       ORDER BY ce.embedding <-> CAST(:qvec AS vector)
+                     )::float) AS score,
+                     (ce.embedding <-> CAST(:qvec AS vector)) AS distance,
+                     c.content_text, c.metadata,
+                     fa.id AS document_id, NULL::uuid AS version_id
+              FROM chunk_embeddings ce
+              JOIN chunks c ON c.id = ce.chunk_id
+              JOIN figma_artifacts fa ON fa.id = c.figma_artifact_id
+              WHERE {figma_vec_where}
+              ORDER BY ce.embedding <-> CAST(:qvec AS vector)
+              LIMIT :k
+            """
+
+        try:
+            rf = await session.execute(text(figma_sql), figma_params)
+            for row in rf.mappings().all():
+                meta = row["metadata"] if isinstance(row["metadata"], dict) else {}
+                meta = {**meta, "source": "figma"}
+                out.append({
+                    "chunk_id":    uuid.UUID(str(row["chunk_id"])) if row["chunk_id"] else None,
+                    "content_text": row["content_text"] or "",
+                    "metadata":    meta,
+                    "document_id": uuid.UUID(str(row["document_id"])) if row["document_id"] else None,
+                    "version_id":  None,
+                    "score":       float(row["score"] or 0.0),
+                })
+        except Exception as _figma_err:
+            logger.warning("[RETRIEVAL] Figma chunk query failed: %s", _figma_err)
+
+        # Re-sort merged results by score and take top_k
+        out.sort(key=lambda x: x["score"], reverse=True)
+        out = out[:top_k]
+
     # Post-fusion relevance filter: drop chunks whose absolute RRF score is below
     # the floor. Chunks are already sorted DESC by score from SQL, so the first
     # item that drops below the floor means all subsequent ones do too.
@@ -490,7 +601,7 @@ async def _claude_answer(
         "╔══════════════════════════════════════════════════════╗\n"
         "║  [CLAUDE PROMPT]  STEP 2 — Q&A ANSWER               ║\n"
         "╚══════════════════════════════════════════════════════╝\n"
-        "  model          : claude-sonnet-4-20250514\n"
+        "  model          : %s\n"
         "  max_tokens     : 1000\n"
         "  context_chunks : %d\n"
         "  history_turns  : %d messages trước\n"
@@ -501,6 +612,7 @@ async def _claude_answer(
         "\n── CURRENT USER TURN ───────────────────────────────────\n"
         "%s\n"
         "════════════════════════════════════════════════════════",
+        settings.anthropic_model,
         len(context_chunks),
         history_count,
         system,
@@ -514,7 +626,7 @@ async def _claude_answer(
         client_kwargs["base_url"] = settings.anthropic_base_url
     client = AsyncAnthropic(**client_kwargs)
     resp = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=settings.anthropic_model,
         max_tokens=1000,
         system=system,
         messages=messages_payload,
@@ -761,13 +873,14 @@ async def create_conversation(
                         "╔══════════════════════════════════════════════════════╗\n"
                         "║  [CLAUDE PROMPT]  STEP 3 — SUGGESTED QUESTIONS      ║\n"
                         "╚══════════════════════════════════════════════════════╝\n"
-                        "  model      : claude-sonnet-4-20250514\n"
+                        "  model      : %s\n"
                         "  max_tokens : 300\n"
                         "  scope_type : %s  scope_config : %s\n"
                         "  seed_chunks: %d đoạn\n"
                         "\n── USER PROMPT ─────────────────────────────────────────\n"
                         "%s\n"
                         "════════════════════════════════════════════════════════",
+                        settings.anthropic_model,
                         _snap_scope_type,
                         json.dumps(_snap_scope_config, ensure_ascii=False),
                         len(seed_rows),
@@ -775,7 +888,7 @@ async def create_conversation(
                     )
                     client = AsyncAnthropic(**client_kwargs)
                     resp = await client.messages.create(
-                        model="claude-sonnet-4-20250514",
+                        model=settings.anthropic_model,
                         max_tokens=300,
                         messages=[{"role": "user", "content": gen_user_content}],
                     )

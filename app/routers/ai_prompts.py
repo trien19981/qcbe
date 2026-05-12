@@ -30,6 +30,9 @@ ALLOWED_KEYS = frozenset(
         ap.QA_ANSWER_SYSTEM,
         ap.QA_SUGGESTED_QUESTIONS_USER,
         ap.TC_GENERATE_PROMPT,
+        ap.QA_GAP_ANALYSIS_PROMPT,
+        ap.TVP_GENERATE_PROMPT,
+        ap.TC_FROM_TVP_PROMPT,
     }
 )
 
@@ -61,6 +64,24 @@ async def list_ai_prompts(
         AiPromptItemOut(
             key=ap.TC_GENERATE_PROMPT,
             content=await ap.get_ai_prompt(session, project_id, ap.TC_GENERATE_PROMPT, ap.DEFAULT_TC_GENERATE_PROMPT),
+        ),
+        AiPromptItemOut(
+            key=ap.QA_GAP_ANALYSIS_PROMPT,
+            content=await ap.get_ai_prompt(
+                session, project_id, ap.QA_GAP_ANALYSIS_PROMPT, ap.DEFAULT_QA_GAP_ANALYSIS_PROMPT
+            ),
+        ),
+        AiPromptItemOut(
+            key=ap.TVP_GENERATE_PROMPT,
+            content=await ap.get_ai_prompt(
+                session, project_id, ap.TVP_GENERATE_PROMPT, ap.DEFAULT_TVP_GENERATE_PROMPT
+            ),
+        ),
+        AiPromptItemOut(
+            key=ap.TC_FROM_TVP_PROMPT,
+            content=await ap.get_ai_prompt(
+                session, project_id, ap.TC_FROM_TVP_PROMPT, ap.DEFAULT_TC_FROM_TVP_PROMPT
+            ),
         ),
     ]
     return AiPromptListResponse(prompts=items)

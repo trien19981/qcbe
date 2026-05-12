@@ -35,11 +35,14 @@ from app.routers import (
     documents,
     embeddings,
     health,
+    integrations,
     invitations,
     project_documents,
     project_documents_upload,
     project_members,
     projects,
+    qa_analyses,
+    test_viewpoints,
     testcases,
 )
 
@@ -108,7 +111,10 @@ app.include_router(chunks.router, prefix="/api/v1", tags=["chunks"])
 app.include_router(embeddings.router, prefix="/api/v1", tags=["embeddings"])
 app.include_router(invitations.router, prefix="/api/v1", tags=["invitations"])
 app.include_router(testcases.router, prefix="/api/v1", tags=["testcases"])
+app.include_router(qa_analyses.router, prefix="/api/v1", tags=["qa-analyses"])
+app.include_router(test_viewpoints.router, prefix="/api/v1", tags=["test-viewpoints"])
 app.include_router(ai_prompts.router, prefix="/api/v1", tags=["ai-prompts"])
+app.include_router(integrations.router, prefix="/api/v1/integrations", tags=["integrations"])
 
 
 @app.get("/")
